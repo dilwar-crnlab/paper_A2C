@@ -15,6 +15,27 @@ import pandas as pd
 from stable_baselines3.common.results_plotter import load_results, ts2xy
 
 
+class TensorPrinter:
+    """
+    A class that contains methods to print tensors in a readable format.
+    """
+    @staticmethod
+    def print_tensor_with_indices(tensor):
+        """
+        Method to print a PyTorch tensor with row and column indices.
+        """
+        num_rows, num_cols = tensor.shape
+        print("Tensor Matrix:")
+        # Print column headers
+        header = " " + " ".join(f"{col:2}" for col in range(num_cols))
+        print(header)
+        print("-" * len(header))
+        
+        # Print rows with indices
+        for row_idx in range(num_rows):
+            row_values = " ".join(f"{value:3.1f}" for value in tensor[row_idx])
+            print(f"Row {row_idx:2}: {row_values}")
+
 class SaveOnBestTrainingRewardCallback(BaseCallback):
 
     def __init__(self, check_freq: int, log_dir: str, verbose=1, show_plot: bool=False):
@@ -71,31 +92,46 @@ class SaveOnBestTrainingRewardCallback(BaseCallback):
 
 
 class GCNLayer(nn.Module):
-   """Single Graph Convolutional Layer"""
-   def __init__(self, in_features, out_features):
+
+    def __init__(self, feature_dim=1):
        super(GCNLayer, self).__init__()
-       self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+       self.weight = nn.Parameter(torch.FloatTensor(feature_dim, feature_dim))
        nn.init.xavier_uniform_(self.weight)
+       #print("Weight ,matrix", self.weight)
    
-   def forward(self, x, adj):
-       adj_hat = adj + torch.eye(adj.size(0), device=adj.device)
-       D = torch.diag(torch.sum(adj_hat, dim=1))
-       D_inv_sqrt = torch.diag(torch.pow(torch.diag(D) + 1e-8, -0.5))
-       support = torch.mm(torch.mm(D_inv_sqrt, adj_hat), D_inv_sqrt)
-       output = torch.mm(torch.mm(support, x), self.weight)
-       return F.relu(output)
+    def forward(self, x, adj):
+        x = x.t()
+        print("X", x.shape)
+        TensorPrinter.print_tensor_with_indices(x)
+        #print("adj matrix in GCNLayer forward", adj.shape)
+
+        if adj.dim() ==3:
+            adj=adj[0]
+        #print("adj matrix in GCNLayer forward", adj.shape)
+
+        adj_hat = adj + torch.eye(adj.size(0), device=adj.device)
+        #print(adj_hat.shape)
+        D = torch.diag(torch.sum(adj_hat, dim=1))
+        D_inv_sqrt = torch.diag(torch.pow(torch.diag(D) + 1e-8, -0.5))
+        #print(D)
+        support = torch.mm(torch.mm(D_inv_sqrt, adj_hat), D_inv_sqrt)
+        #TensorPrinter.print_tensor_with_indices(support)
+        output = torch.mm(torch.mm(support, x), self.weight)
+        return F.relu(output)
 
 class GCNModule(nn.Module):
-   def __init__(self, input_size, hidden_size):
+   def __init__(self, num_nodes):
        super(GCNModule, self).__init__()
-       self.gcn = GCNLayer(input_size, hidden_size)
+       self.gcn = GCNLayer(feature_dim=1)
        self.memory = None
        
-   def forward(self, x, adj, switch_on=True):
-       out = self.gcn(x, adj)
+   def forward(self, x, adj, switch_on):
+       input_features = x if x is not None else self.memory
+       print("Input in GCN Module forward", input_features )
        if switch_on:
+           out = self.gcn(input_features, adj)
            self.memory = out
-       return self.memory if self.memory is not None else out
+       return self.memory
    
    def reset_memory(self):
        self.memory = None
@@ -112,23 +148,19 @@ class SimpleRNNLayer(nn.Module):
 class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
    def __init__(self, observation_space, num_original_nodes=14, num_edges=44, k_paths=5, num_bands=2, hidden_size=128):
        super().__init__(observation_space, features_dim=hidden_size)
-       
        self.num_original_nodes = num_original_nodes
-       self.num_edges = num_edges
+       self.num_edges = num_edges 
        self.k_paths = k_paths
        self.num_bands = num_bands
        self.hidden_size = hidden_size
        
-       self.gcn_modules = nn.ModuleList([
-           GCNModule(num_edges, hidden_size) 
-           for _ in range(k_paths)
-       ])
+       self.gcn_modules = nn.ModuleList([GCNModule(num_edges) for _ in range(k_paths)])
        
        self.rnn = SimpleRNNLayer(hidden_size, hidden_size)
        
        fc_input_size = (hidden_size + 
                        2*num_original_nodes +
-                       k_paths +
+                       k_paths + 
                        k_paths*6*num_bands)
        
        self.fc = nn.Sequential(
@@ -146,7 +178,6 @@ class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
        
    def forward(self, obs):
        batch_size = obs.shape[0]
-       
        idx = 0
        source_dest = obs[:, idx:idx + 2*self.num_original_nodes]
        idx += 2*self.num_original_nodes
@@ -161,16 +192,28 @@ class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
        idx += self.num_edges*self.k_paths
        
        adj_matrix = obs[:, idx:].reshape(batch_size, self.num_edges, self.num_edges)
+       #print("Adj matrix shape",adj_matrix.shape)
        
        gcn_outputs = []
        for i in range(self.k_paths):
+           print("--------------------")
+           print("Path ", i)
            path_features = feature_matrix[:, i, :]
-           out = self.gcn_modules[i](path_features, adj_matrix)
+           path_length = torch.sum(path_features != 0).item()
+           #print("path length", path_length)
+           
+           for step in range(path_length):
+               print("For step----------------------------------------------------------------------", step)
+               input_features = path_features if step == 0 else None
+               #print("Input features", input_features.shape)
+               switch_on = step < path_length
+               #print("Switch on", switch_on)
+               out = self.gcn_modules[i](input_features, adj_matrix, switch_on)
+               
            gcn_outputs.append(out)
        
        gcn_outputs = torch.stack(gcn_outputs, dim=1)
        rnn_out = self.rnn(gcn_outputs)
-       
        combined = torch.cat([rnn_out, source_dest, slots, spectrum], dim=1)
        return self.fc(combined)
 
@@ -182,19 +225,18 @@ class DeepRMSAPolicy(ActorCriticPolicy):
            lr_schedule,
            **kwargs
        )
-       
        self.policy_net = nn.Linear(self.features_dim, action_space.n)
        self.value_net = nn.Linear(self.features_dim, 1)
        
    def forward(self, obs, deterministic=False):
        features = self.extract_features(obs)
-       
        action_logits = self.policy_net(features)
        action_probs = F.softmax(action_logits, dim=1)
-       
        value = self.value_net(features)
-       
        return action_probs, value
+
+
+
 
 def main():
    topology_name = 'nsfnet_chen'
