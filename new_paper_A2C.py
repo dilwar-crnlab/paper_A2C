@@ -97,25 +97,13 @@ class GCNLayer(nn.Module):
        super(GCNLayer, self).__init__()
        self.weight = nn.Parameter(torch.FloatTensor(feature_dim, feature_dim))
        nn.init.xavier_uniform_(self.weight)
-       #print("Weight ,matrix", self.weight)
-   
     def forward(self, x, adj):
-        x = x.t()
-        print("X", x.shape)
-        TensorPrinter.print_tensor_with_indices(x)
-        #print("adj matrix in GCNLayer forward", adj.shape)
-
         if adj.dim() ==3:
             adj=adj[0]
-        #print("adj matrix in GCNLayer forward", adj.shape)
-
         adj_hat = adj + torch.eye(adj.size(0), device=adj.device)
-        #print(adj_hat.shape)
         D = torch.diag(torch.sum(adj_hat, dim=1))
         D_inv_sqrt = torch.diag(torch.pow(torch.diag(D) + 1e-8, -0.5))
-        #print(D)
         support = torch.mm(torch.mm(D_inv_sqrt, adj_hat), D_inv_sqrt)
-        #TensorPrinter.print_tensor_with_indices(support)
         output = torch.mm(torch.mm(support, x), self.weight)
         return F.relu(output)
 
@@ -124,98 +112,130 @@ class GCNModule(nn.Module):
        super(GCNModule, self).__init__()
        self.gcn = GCNLayer(feature_dim=1)
        self.memory = None
-       
    def forward(self, x, adj, switch_on):
        input_features = x if x is not None else self.memory
-       print("Input in GCN Module forward", input_features )
        if switch_on:
            out = self.gcn(input_features, adj)
            self.memory = out
        return self.memory
-   
    def reset_memory(self):
        self.memory = None
 
 class SimpleRNNLayer(nn.Module):
-   def __init__(self, input_size, hidden_size):
-       super(SimpleRNNLayer, self).__init__()
-       self.rnn = nn.RNN(input_size, hidden_size, batch_first=True)
-       
-   def forward(self, x):
-       output, _ = self.rnn(x)
-       return output[:, -1, :]
+    def __init__(self, input_size, hidden_size):
+        super(SimpleRNNLayer, self).__init__()
+        feature_dim = 44  # or num_edges * feature_dim_per_edge if dynamic
+        self.rnn = nn.RNN(input_size, hidden_size) #self.rnn = nn.RNN(input_size=feature_dim, hidden_size=hidden_size, batch_first=True)
+        self.rnn = nn.RNN(input_size=feature_dim, hidden_size=hidden_size, batch_first=True)
+    def forward(self, x):
+        output, _ = self.rnn(x)
+        return output[:, -1, :]
 
 class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
-   def __init__(self, observation_space, num_original_nodes=14, num_edges=44, k_paths=5, num_bands=2, hidden_size=128):
-       super().__init__(observation_space, features_dim=hidden_size)
-       self.num_original_nodes = num_original_nodes
-       self.num_edges = num_edges 
-       self.k_paths = k_paths
-       self.num_bands = num_bands
-       self.hidden_size = hidden_size
+    def __init__(self, observation_space, P, num_original_nodes=14, num_edges=44, k_paths=5, num_bands=2, hidden_size=128):
+        super().__init__(observation_space, features_dim=hidden_size)
+        self.num_original_nodes = num_original_nodes
+        self.num_edges = num_edges 
+        self.k_paths = k_paths
+        self.P=P
+        self.num_bands = num_bands
+        self.hidden_size = hidden_size
+
+        self.gcn_modules = nn.ModuleList([GCNModule(num_edges) for _ in range(k_paths)])
+        self.rnn = SimpleRNNLayer(hidden_size, hidden_size)
+
+        fc_input_size = (hidden_size + 
+                        2*num_original_nodes +
+                        k_paths + 
+                        k_paths*6*num_bands)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(fc_input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU()
+        )
        
-       self.gcn_modules = nn.ModuleList([GCNModule(num_edges) for _ in range(k_paths)])
-       
-       self.rnn = SimpleRNNLayer(hidden_size, hidden_size)
-       
-       fc_input_size = (hidden_size + 
-                       2*num_original_nodes +
-                       k_paths + 
-                       k_paths*6*num_bands)
-       
-       self.fc = nn.Sequential(
-           nn.Linear(fc_input_size, hidden_size),
-           nn.ReLU(),
-           nn.Linear(hidden_size, hidden_size),
-           nn.ReLU(),
-           nn.Linear(hidden_size, hidden_size),
-           nn.ReLU(),
-           nn.Linear(hidden_size, hidden_size),
-           nn.ReLU(),
-           nn.Linear(hidden_size, hidden_size),
-           nn.ReLU()
-       )
-       
-   def forward(self, obs):
-       batch_size = obs.shape[0]
-       idx = 0
-       source_dest = obs[:, idx:idx + 2*self.num_original_nodes]
-       idx += 2*self.num_original_nodes
-       
-       slots = obs[:, idx:idx + self.k_paths]
-       idx += self.k_paths
-       
-       spectrum = obs[:, idx:idx + self.k_paths*6*self.num_bands]
-       idx += self.k_paths*6*self.num_bands
-       
-       feature_matrix = obs[:, idx:idx + self.num_edges*self.k_paths].reshape(batch_size, self.k_paths, self.num_edges)
-       idx += self.num_edges*self.k_paths
-       
-       adj_matrix = obs[:, idx:].reshape(batch_size, self.num_edges, self.num_edges)
-       #print("Adj matrix shape",adj_matrix.shape)
-       
-       gcn_outputs = []
-       for i in range(self.k_paths):
-           print("--------------------")
-           print("Path ", i)
-           path_features = feature_matrix[:, i, :]
-           path_length = torch.sum(path_features != 0).item()
-           #print("path length", path_length)
-           
-           for step in range(path_length):
-               print("For step----------------------------------------------------------------------", step)
-               input_features = path_features if step == 0 else None
-               #print("Input features", input_features.shape)
-               switch_on = step < path_length
-               #print("Switch on", switch_on)
-               out = self.gcn_modules[i](input_features, adj_matrix, switch_on)
-               
-           gcn_outputs.append(out)
-       
-       gcn_outputs = torch.stack(gcn_outputs, dim=1)
-       rnn_out = self.rnn(gcn_outputs)
-       combined = torch.cat([rnn_out, source_dest, slots, spectrum], dim=1)
-       return self.fc(combined)
+    def forward(self, obs):
+        batch_size = obs.shape[0]
+        idx = 0
+        source_dest = obs[:, idx:idx + 2*self.num_original_nodes]
+        idx += 2*self.num_original_nodes
+        slots = obs[:, idx:idx + self.k_paths]
+        print("Slots", slots.t())
+        idx += self.k_paths
+
+        spectrum = obs[:, idx:idx + self.k_paths*6*self.num_bands]
+        print("Spectrum", spectrum)
+        spectrum_tensor = spectrum.view(5, 2, 6)  # Shape: [5 paths, 2 bands, 6 features]
+        print("Spectrum", spectrum_tensor.shape)
+
+        num_paths = len(spectrum)  # Number of paths
+        num_bands = 2  # Number of bands
+        feature_keys = ['N_FS', 'N_FSB', 'N_FSB_prime', 'I_start', 'S_first', 'S_FSB']  # Keys to extract
+
+        # # Initialize tensor to store features
+        # spectrum_tensor = torch.zeros((num_paths, num_bands, len(feature_keys)))
+
+        # # Populate the tensor
+        # for path_idx, bands in spectrum.items():
+        #     for band, features in bands.items():
+        #         for key_idx, key in enumerate(feature_keys):
+        #             spectrum_tensor[path_idx, band, key_idx] = features[key]
+
+        # print("Spectrum", spectrum_tensor)
+
+        idx += self.k_paths*6*self.num_bands
+        feature_matrix = obs[:, idx:idx + self.num_edges*self.k_paths].reshape(batch_size, self.k_paths, self.num_edges)
+        idx += self.num_edges*self.k_paths
+        adj_matrix = obs[:, idx:].reshape(batch_size, self.num_edges, self.num_edges)
+ 
+        gcn_outputs = []
+        rnn_inputs= []
+        for i in range(self.k_paths):
+            print("For path ------------------------------------------------------------------------------",i)
+            path_features = feature_matrix[:, i, :]
+            path_features= path_features.t()
+            path_length = torch.sum(path_features != 0).item()    
+            path_outputs = []      
+            for step in range(path_length):
+                #print("For step----------------------------------------------------------------------", step)
+                input_features = path_features if step == 0 else None
+                #print("Input features", input_features.shape)
+                switch_on = step < path_length
+                #print("Switch on", switch_on)
+                out = self.gcn_modules[i](input_features, adj_matrix, switch_on)
+                path_outputs.append(out)
+
+            # Continue propagating final memory value until P steps
+            final_memory = self.gcn_modules[i].memory
+            for _ in range(path_length, self.P):
+                path_outputs.append(final_memory)   
+
+            # Stack P outputs for this path
+            path_sequence = torch.stack(path_outputs, dim=0)
+            #print("path_sequence", path_sequence)
+            print("path_sequence shape", path_sequence.shape)
+            rnn_inputs.append(path_sequence)
+        
+        # Stack all paths' sequences
+        rnn_inputs = torch.stack(rnn_inputs, dim=0)
+        rnn_inputs = rnn_inputs.view(-1, rnn_inputs.shape[1], rnn_inputs.shape[2] * rnn_inputs.shape[3])  # Shape: [batch_size * k_paths, P, 44]
+        print("RNN inputs", rnn_inputs.shape)
+        rnn_out = self.rnn(rnn_inputs)
+        print("rnn_out shape:", rnn_out.shape)
+        print("source_dest shape:", source_dest.shape)
+        print("slots shape:", slots.shape)
+        print("spectrum shape:", spectrum.shape)
+
+        combined = torch.cat([rnn_out, source_dest, slots, spectrum], dim=1)
+        return self.fc(combined)
 
 class DeepRMSAPolicy(ActorCriticPolicy):
    def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
@@ -239,69 +259,89 @@ class DeepRMSAPolicy(ActorCriticPolicy):
 
 
 def main():
-   topology_name = 'nsfnet_chen'
-   k_paths = 5
-   with open(f'../topologies/{topology_name}_{k_paths}-paths_new.h5', 'rb') as f:
-       topology = pickle.load(f)
+    topology_name = 'nsfnet_chen'
+    k_paths = 5
+    with open(f'../topologies/{topology_name}_{k_paths}-paths_new.h5', 'rb') as f:
+        topology = pickle.load(f)
 
-   env_args = dict(
-       num_bands=2,
-       topology=topology, 
-       seed=10,
-       allow_rejection=False,
-       j=1,
-       mean_service_holding_time=25.0,
-       mean_service_inter_arrival_time=0.1,
-       k_paths=k_paths,
-       episode_length=100,
-       node_request_probabilities=None
-   )
+    k_shortest_paths = topology.graph["ksp"]
+    
+    def find_longest_path_by_hops(k_shortest_paths):
+        longest_path = None
+        max_hops = 0
+        source_dest = None
+        # Iterate through all source-destination pairs
+        for (src, dst), paths in k_shortest_paths.items():
+            # Check each path for this source-destination pair
+            for path in paths:
+                # Number of hops is the number of nodes minus 1
+                num_hops = len(path.node_list) - 1
+                if num_hops > max_hops:
+                    max_hops = num_hops
+                    longest_path = path
+                    source_dest = (src, dst)
+        return max_hops
+    logest_path=find_longest_path_by_hops(k_shortest_paths)
+    env_args = dict(
+        num_bands=2,
+        topology=topology, 
+        seed=10,
+        allow_rejection=False,
+        j=1,
+        mean_service_holding_time=25.0,
+        mean_service_inter_arrival_time=0.1,
+        k_paths=k_paths,
+        episode_length=100,
+        node_request_probabilities=None
+    )
 
-   log_dir = "./tmp/deeprmsa-a2c/"
-   os.makedirs(log_dir, exist_ok=True)
-   callback = SaveOnBestTrainingRewardCallback(check_freq=100, log_dir=log_dir, show_plot=False)
-   
-   monitor_info_keywords = (
-       "service_blocking_rate",
-       "episode_service_blocking_rate",
-       "bit_rate_blocking_rate",
-       "episode_bit_rate_blocking_rate",
-   )
+    log_dir = "./tmp/deeprmsa-a2c/"
+    os.makedirs(log_dir, exist_ok=True)
+    callback = SaveOnBestTrainingRewardCallback(check_freq=100, log_dir=log_dir, show_plot=False)
 
-   env = gym.make('DeepRMSA-v0', **env_args)
-   env = Monitor(env, log_dir + 'training', info_keywords=monitor_info_keywords)
+    monitor_info_keywords = (
+        "service_blocking_rate",
+        "episode_service_blocking_rate",
+        "bit_rate_blocking_rate",
+        "episode_bit_rate_blocking_rate",
+    )
 
-   policy_kwargs = dict(
-       features_extractor_class=DeepRMSAFeatureExtractor,
-       features_extractor_kwargs=dict(
-           num_original_nodes=topology.number_of_nodes(),
-           num_edges=topology.number_of_edges(),
-           k_paths=k_paths,
-           num_bands=env_args['num_bands'],
-           hidden_size=128
-       ),
-   )
+    env = gym.make('DeepRMSA-v0', **env_args)
+    env = Monitor(env, log_dir + 'training', info_keywords=monitor_info_keywords)
 
-   model = A2C(
-       policy=DeepRMSAPolicy,
-       env=env,
-       learning_rate=1e-4,
-       n_steps=5,
-       gamma=0.95,
-       ent_coef=0.01,
-       vf_coef=0.5,
-       max_grad_norm=0.5,
-       tensorboard_log="./tb/A2C-DeepRMSA-v0/",
-       policy_kwargs=policy_kwargs,
-       verbose=1
-   )
+    policy_kwargs = dict(
+        features_extractor_class=DeepRMSAFeatureExtractor,
+        features_extractor_kwargs=dict(
+            P=logest_path,
+            num_original_nodes=topology.number_of_nodes(),
+            num_edges=topology.number_of_edges(),
+            k_paths=k_paths,
+            
+            num_bands=env_args['num_bands'],
+            hidden_size=128
+        ),
+    )
 
-   model.learn(
-       total_timesteps=1000000,
-       callback=callback
-   )
+    model = A2C(
+        policy=DeepRMSAPolicy,
+        env=env,
+        learning_rate=1e-4,
+        n_steps=5,
+        gamma=0.95,
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        tensorboard_log="./tb/A2C-DeepRMSA-v0/",
+        policy_kwargs=policy_kwargs,
+        verbose=1
+    )
 
-   model.save(f"{log_dir}/final_model")
+    model.learn(
+        total_timesteps=1000000,
+        callback=callback
+    )
+
+    model.save(f"{log_dir}/final_model")
 
 if __name__ == "__main__":
    main()
