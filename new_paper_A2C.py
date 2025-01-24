@@ -122,14 +122,32 @@ class GCNModule(nn.Module):
        self.memory = None
 
 class SimpleRNNLayer(nn.Module):
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, k_paaths, input_size, hidden_size=256):
         super(SimpleRNNLayer, self).__init__()
-        feature_dim = 44  # or num_edges * feature_dim_per_edge if dynamic
-        self.rnn = nn.RNN(input_size, hidden_size) #self.rnn = nn.RNN(input_size=feature_dim, hidden_size=hidden_size, batch_first=True)
-        self.rnn = nn.RNN(input_size=feature_dim, hidden_size=hidden_size, batch_first=True)
-    def forward(self, x):
-        output, _ = self.rnn(x)
-        return output[:, -1, :]
+        self.k_paths= k_paaths
+        self.feature_dim = input_size
+        self.rnn = nn.RNN(
+           input_size=input_size,  
+           hidden_size=hidden_size,
+           batch_first=True,
+           #num_layers=1
+        )
+        
+
+    
+    def forward(self, path_sequences):
+       # path_sequences: [batch_size, k_paths, P, feature_dim]
+       batch_size = 1
+       
+       # Reshape to [1, k_paths, P, num_edges]
+       path_sequences = path_sequences.unsqueeze(0)
+       # Reshape for RNN: [1*k_paths, P, num_edges]
+       rnn_input = path_sequences.view(batch_size*self.k_paths, -1, self.feature_dim)
+        
+       output, _ = self.rnn(rnn_input)
+       final_hidden = output[:, -1, :]  # [batch_size*k_paths, hidden_size]
+        
+       return final_hidden.view(batch_size, -1)  # [1, k_paths*hidden_size]
 
 class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, P, num_original_nodes=14, num_edges=44, k_paths=5, num_bands=2, hidden_size=128):
@@ -142,12 +160,16 @@ class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
         self.hidden_size = hidden_size
 
         self.gcn_modules = nn.ModuleList([GCNModule(num_edges) for _ in range(k_paths)])
-        self.rnn = SimpleRNNLayer(hidden_size, hidden_size)
+        # RNN with 256 neurons
+        self.rnn = SimpleRNNLayer(k_paths, input_size=num_edges, hidden_size=256)
 
-        fc_input_size = (hidden_size + 
-                        2*num_original_nodes +
-                        k_paths + 
-                        k_paths*6*num_bands)
+        # Calculate input size for FC layer
+        fc_input_size = (256 +                    # RNN output (k_paths * hidden_size/k_paths)
+                        2*num_original_nodes +     # Source-dest (28)
+                        k_paths +                  # Slots (5)
+                        k_paths*6 +                # C band features (30)
+                        k_paths*6)                 # L band features (30)
+                    # Total: 349
         
         self.fc = nn.Sequential(
             nn.Linear(fc_input_size, hidden_size),
@@ -165,43 +187,39 @@ class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
     def forward(self, obs):
         batch_size = obs.shape[0]
         idx = 0
-        source_dest = obs[:, idx:idx + 2*self.num_original_nodes]
+        source_dest = obs[:, idx:idx + 2*self.num_original_nodes]  # [1, 28]
         idx += 2*self.num_original_nodes
+
         slots = obs[:, idx:idx + self.k_paths]
-        print("Slots", slots.t())
+        slots = obs[:, idx:idx + self.k_paths]  # [1, 5]
+
         idx += self.k_paths
 
-        spectrum = obs[:, idx:idx + self.k_paths*6*self.num_bands]
-        print("Spectrum", spectrum)
-        spectrum_tensor = spectrum.view(5, 2, 6)  # Shape: [5 paths, 2 bands, 6 features]
-        print("Spectrum", spectrum_tensor.shape)
 
-        num_paths = len(spectrum)  # Number of paths
-        num_bands = 2  # Number of bands
-        feature_keys = ['N_FS', 'N_FSB', 'N_FSB_prime', 'I_start', 'S_first', 'S_FSB']  # Keys to extract
-
-        # # Initialize tensor to store features
-        # spectrum_tensor = torch.zeros((num_paths, num_bands, len(feature_keys)))
-
-        # # Populate the tensor
-        # for path_idx, bands in spectrum.items():
-        #     for band, features in bands.items():
-        #         for key_idx, key in enumerate(feature_keys):
-        #             spectrum_tensor[path_idx, band, key_idx] = features[key]
-
-        # print("Spectrum", spectrum_tensor)
-
+         # Extract and reshape spectrum features for C and L bands
+        spectrum_raw = obs[:, idx:idx + self.k_paths*6*self.num_bands]
+        # Reshape to [batch_size, k_paths, num_bands, 6_features]
+        spectrum = spectrum_raw.view(batch_size, self.k_paths, self.num_bands, 6)
+        
+        # Separate C and L band features
+        c_band_features = spectrum[:, :, 0, :]  # [1, 5, 6]
+        l_band_features = spectrum[:, :, 1, :]  # [1, 5, 6]
+        #print("C band ", c_band_features)
+        #print("L band ", l_band_features)
         idx += self.k_paths*6*self.num_bands
+
         feature_matrix = obs[:, idx:idx + self.num_edges*self.k_paths].reshape(batch_size, self.k_paths, self.num_edges)
         idx += self.num_edges*self.k_paths
+
         adj_matrix = obs[:, idx:].reshape(batch_size, self.num_edges, self.num_edges)
- 
-        gcn_outputs = []
+
         rnn_inputs= []
+        path_sequences = []
         for i in range(self.k_paths):
             print("For path ------------------------------------------------------------------------------",i)
             path_features = feature_matrix[:, i, :]
             path_features= path_features.t()
+            print("Path_feature shape", path_features.shape)
             path_length = torch.sum(path_features != 0).item()    
             path_outputs = []      
             for step in range(path_length):
@@ -220,21 +238,31 @@ class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
 
             # Stack P outputs for this path
             path_sequence = torch.stack(path_outputs, dim=0)
+            path_sequences.append(path_sequence)
             #print("path_sequence", path_sequence)
-            print("path_sequence shape", path_sequence.shape)
-            rnn_inputs.append(path_sequence)
+            #print("path_sequence shape", path_sequence.shape)
+            
         
         # Stack all paths' sequences
-        rnn_inputs = torch.stack(rnn_inputs, dim=0)
-        rnn_inputs = rnn_inputs.view(-1, rnn_inputs.shape[1], rnn_inputs.shape[2] * rnn_inputs.shape[3])  # Shape: [batch_size * k_paths, P, 44]
+        # Process through RNN
+        rnn_inputs = torch.stack(path_sequences, dim=0)  # [k_paths, P, num_edges]
+        rnn_out = self.rnn(rnn_inputs)  # [batch_size, k_paths*hidden_size]
         print("RNN inputs", rnn_inputs.shape)
-        rnn_out = self.rnn(rnn_inputs)
+        
         print("rnn_out shape:", rnn_out.shape)
         print("source_dest shape:", source_dest.shape)
         print("slots shape:", slots.shape)
         print("spectrum shape:", spectrum.shape)
 
-        combined = torch.cat([rnn_out, source_dest, slots, spectrum], dim=1)
+        #combined = torch.cat([rnn_out, source_dest, slots, spectrum], dim=1)
+        # Combine all features with separate C and L band features
+        combined = torch.cat([
+            rnn_out,                    # Path features from RNN
+            source_dest,                # Source-destination encoding
+            slots,                      # Slots per path
+            c_band_features.reshape(batch_size, -1),        # [batch_size, k_paths*6]
+            l_band_features.reshape(batch_size, -1)         # [batch_size, k_paths*6] 
+        ], dim=1)
         return self.fc(combined)
 
 class DeepRMSAPolicy(ActorCriticPolicy):
