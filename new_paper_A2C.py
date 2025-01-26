@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Categorical
 import gym
 from stable_baselines3 import A2C
 from stable_baselines3.common.policies import ActorCriticPolicy
@@ -13,28 +14,6 @@ from stable_baselines3.common.callbacks import BaseCallback
 import matplotlib.pyplot as plt
 import pandas as pd
 from stable_baselines3.common.results_plotter import load_results, ts2xy
-
-
-class TensorPrinter:
-    """
-    A class that contains methods to print tensors in a readable format.
-    """
-    @staticmethod
-    def print_tensor_with_indices(tensor):
-        """
-        Method to print a PyTorch tensor with row and column indices.
-        """
-        num_rows, num_cols = tensor.shape
-        print("Tensor Matrix:")
-        # Print column headers
-        header = " " + " ".join(f"{col:2}" for col in range(num_cols))
-        print(header)
-        print("-" * len(header))
-        
-        # Print rows with indices
-        for row_idx in range(num_rows):
-            row_values = " ".join(f"{value:3.1f}" for value in tensor[row_idx])
-            print(f"Row {row_idx:2}: {row_values}")
 
 class SaveOnBestTrainingRewardCallback(BaseCallback):
 
@@ -90,16 +69,23 @@ class SaveOnBestTrainingRewardCallback(BaseCallback):
 
         return True
 
-
+# ------------------- GCN Layer -------------------
 class GCNLayer(nn.Module):
-
+    """
+    Simple GCN layer that expects:
+      x:   [num_nodes, feature_dim]
+      adj: [num_nodes, num_nodes]
+    """
     def __init__(self, feature_dim=1):
-       super(GCNLayer, self).__init__()
-       self.weight = nn.Parameter(torch.FloatTensor(feature_dim, feature_dim))
-       nn.init.xavier_uniform_(self.weight)
+        super(GCNLayer, self).__init__()
+        self.weight = nn.Parameter(torch.FloatTensor(feature_dim, feature_dim))
+        nn.init.xavier_uniform_(self.weight)
+
     def forward(self, x, adj):
-        if adj.dim() ==3:
-            adj=adj[0]
+        # If adjacency has shape [batch_size, num_nodes, num_nodes], just take the first
+        if adj.dim() == 3:
+            adj = adj[0]
+
         adj_hat = adj + torch.eye(adj.size(0), device=adj.device)
         D = torch.diag(torch.sum(adj_hat, dim=1))
         D_inv_sqrt = torch.diag(torch.pow(torch.diag(D) + 1e-8, -0.5))
@@ -107,70 +93,127 @@ class GCNLayer(nn.Module):
         output = torch.mm(torch.mm(support, x), self.weight)
         return F.relu(output)
 
-class GCNModule(nn.Module):
-   def __init__(self, num_nodes):
-       super(GCNModule, self).__init__()
-       self.gcn = GCNLayer(feature_dim=1)
-       self.memory = None
-   def forward(self, x, adj, switch_on):
-       input_features = x if x is not None else self.memory
-       if switch_on:
-           out = self.gcn(input_features, adj)
-           self.memory = out
-       return self.memory
-   def reset_memory(self):
-       self.memory = None
 
+# ------------------- Recurrent GCN Module (per path) -------------------
+class GCNModule(nn.Module):
+    """
+    Wraps one GCN layer with a "memory" so we can repeatedly apply it
+    for P "circulations" (time steps). If switch_on=False, we re-use
+    the last memory (not updating).
+    """
+    def __init__(self, num_nodes):
+        super(GCNModule, self).__init__()
+        self.gcn = GCNLayer(feature_dim=1)
+        self.memory = None
+
+    def forward(self, x, adj, switch_on):
+        """
+        x: [num_nodes, 1] or None.
+        adj: [num_nodes, num_nodes].
+        switch_on: bool indicating whether to update memory.
+        """
+        input_features = x if x is not None else self.memory
+        if switch_on:
+            out = self.gcn(input_features, adj)
+            self.memory = out
+        return self.memory  # Always return current memory
+
+    def reset_memory(self):
+        self.memory = None
+
+
+# ------------------- Simple RNN Aggregation -------------------
 class SimpleRNNLayer(nn.Module):
+    """
+    Expects input of shape [batch_size, k_paths, P, feature_dim_for_each_step]
+    and returns [batch_size, k_paths * hidden_size].
+    """
     def __init__(self, k_paaths, input_size, hidden_size=256):
         super(SimpleRNNLayer, self).__init__()
-        self.k_paths= k_paaths
+        self.k_paths = k_paaths
         self.feature_dim = input_size
+        self.hidden_size = hidden_size
+
         self.rnn = nn.RNN(
            input_size=input_size,  
            hidden_size=hidden_size,
-           batch_first=True,
-           #num_layers=1
+           batch_first=True
         )
-        
 
-    
     def forward(self, path_sequences):
-       # path_sequences: [batch_size, k_paths, P, feature_dim]
-       batch_size = 1
-       
-       # Reshape to [1, k_paths, P, num_edges]
-       path_sequences = path_sequences.unsqueeze(0)
-       # Reshape for RNN: [1*k_paths, P, num_edges]
-       rnn_input = path_sequences.view(batch_size*self.k_paths, -1, self.feature_dim)
-        
-       output, _ = self.rnn(rnn_input)
-       final_hidden = output[:, -1, :]  # [batch_size*k_paths, hidden_size]
-        
-       return final_hidden.view(batch_size, -1)  # [1, k_paths*hidden_size]
+        """
+        path_sequences shape: [batch_size, k_paths, P, feature_dim]
 
+        We'll reshape to [batch_size*k_paths, P, feature_dim], run RNN,
+        then reshape final hidden state to [batch_size, k_paths*hidden_size].
+        """
+        batch_size = path_sequences.size(0)
+        # Flatten the (batch, k_paths) dimension => batch_size*k_paths
+        rnn_input = path_sequences.view(
+            batch_size * self.k_paths,
+            path_sequences.size(2),   # P
+            path_sequences.size(3)    # feature_dim
+        )
+        output, _ = self.rnn(rnn_input)
+        # Grab the last time-step’s output => [batch_size*k_paths, hidden_size]
+        final_hidden = output[:, -1, :]
+
+        # Reshape to [batch_size, k_paths*hidden_size]
+        return final_hidden.view(batch_size, -1)
+
+
+# ------------------- SB3 Features Extractor -------------------
 class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space, P, num_original_nodes=14, num_edges=44, k_paths=5, num_bands=2, hidden_size=128):
+    """
+    1) Parse an observation that contains:
+       - source_dest, slots, spectrum C/L band info
+       - feature_matrix (k_paths x num_edges)
+       - adjacency matrix
+    2) For each path, unroll GCN up to P steps, collecting outputs
+    3) Pass all path sequences to RNN => aggregated vector
+    4) Concatenate with other scalar features => final FC
+    """
+    def __init__(
+        self,
+        observation_space,
+        P,
+        num_original_nodes=14,
+        num_edges=44,
+        k_paths=5,
+        num_bands=2,
+        hidden_size=128
+    ):
         super().__init__(observation_space, features_dim=hidden_size)
+
         self.num_original_nodes = num_original_nodes
-        self.num_edges = num_edges 
+        self.num_edges = num_edges
         self.k_paths = k_paths
-        self.P=P
+        self.P = P
         self.num_bands = num_bands
         self.hidden_size = hidden_size
+        print("Hidden", self.hidden_size)
 
+        # K GCN modules
         self.gcn_modules = nn.ModuleList([GCNModule(num_edges) for _ in range(k_paths)])
-        # RNN with 256 neurons
-        self.rnn = SimpleRNNLayer(k_paths, input_size=num_edges, hidden_size=256)
+        # RNN aggregator
+        self.rnn = SimpleRNNLayer(
+            k_paaths=k_paths,
+            input_size=num_edges,  # We'll flatten 44x1 => 44
+            hidden_size=256
+        )
 
-        # Calculate input size for FC layer
-        fc_input_size = (256 +                    # RNN output (k_paths * hidden_size/k_paths)
-                        2*num_original_nodes +     # Source-dest (28)
-                        k_paths +                  # Slots (5)
-                        k_paths*6 +                # C band features (30)
-                        k_paths*6)                 # L band features (30)
-                    # Total: 349
-        
+        # Compute size for FC input
+        # = RNN output (k_paths * 256) + 2*num_original_nodes + k_paths + k_paths*6 + k_paths*6
+        # = (k_paths*256) + 28 + 5 + 30 + 30 = 1283 if k_paths=5
+        fc_input_size = (
+            (k_paths * 256) +
+            (2 * num_original_nodes) +
+             k_paths +
+            (k_paths * 6) +
+            (k_paths * 6)
+        )
+
+        # A multi-layer FC
         self.fc = nn.Sequential(
             nn.Linear(fc_input_size, hidden_size),
             nn.ReLU(),
@@ -183,107 +226,187 @@ class DeepRMSAFeatureExtractor(BaseFeaturesExtractor):
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU()
         )
-       
+
     def forward(self, obs):
         batch_size = obs.shape[0]
         idx = 0
-        source_dest = obs[:, idx:idx + 2*self.num_original_nodes]  # [1, 28]
+        #print("batch size", batch_size)
+        indx=0
+        #print("OBS", obs.shape)
+        #print("First 28 elements of obs tensor:", obs[0, :28])
+        # Print the first 14 elements
+        #print("First 14 elements of obs tensor (Source One-Hot):", obs[0, indx:indx + 14])
+        indx += 14
+
+        # Print the next 14 elements
+        #print("Next 14 elements of obs tensor (Destination One-Hot):", obs[0, indx:indx + 14])
+        indx += 14
+
+        # Print the next 5 elements
+        #print("Next 5 elements of obs tensor (Slots):", obs[0, indx:indx + 5])
+        indx += 5
+
+        # Print the next 60 elements
+        #print("Next 60 elements of obs tensor (Spectrum):", obs[0, indx:indx + 60])
+        indx += 60
+        #print("indx", indx)
+
+        # Print the next 60 elements
+        #print("Next 220 elements of obs tensor (Spectrum):", obs[0, indx:indx + 220])
+        indx += 220
+        
+
+        # feature_matrix_flattened = obs[:, 93:93 + self.num_edges * self.k_paths]
+        # feature_matrix = feature_matrix_flattened.view(batch_size, self.num_edges, self.k_paths)
+        # #print("Reconstructed Feature Matrix (44x5):", feature_matrix)
+
+        # 1) Parse source-dest
+        source_dest = obs[:, idx : idx + 2*self.num_original_nodes]
+        #print("Src Dst", source_dest)
+        reshaped_tensor = source_dest.view(-1, 14)  # Reshape to (1, 14) if needed
+        original_numbers = [torch.argmax(reshaped_tensor[i]).item()+1 for i in range(reshaped_tensor.size(0))]
+        #print("Src Dst", original_numbers)
+
         idx += 2*self.num_original_nodes
 
-        slots = obs[:, idx:idx + self.k_paths]
-        slots = obs[:, idx:idx + self.k_paths]  # [1, 5]
-
+        # 2) Parse slots
+        slots = obs[:, idx : idx + self.k_paths]  # shape [batch_size, k_paths]
         idx += self.k_paths
+        #print("slots", slots)
 
-
-         # Extract and reshape spectrum features for C and L bands
-        spectrum_raw = obs[:, idx:idx + self.k_paths*6*self.num_bands]
-        # Reshape to [batch_size, k_paths, num_bands, 6_features]
-        spectrum = spectrum_raw.view(batch_size, self.k_paths, self.num_bands, 6)
-        
-        # Separate C and L band features
-        c_band_features = spectrum[:, :, 0, :]  # [1, 5, 6]
-        l_band_features = spectrum[:, :, 1, :]  # [1, 5, 6]
-        #print("C band ", c_band_features)
-        #print("L band ", l_band_features)
+        # 3) Parse spectrum for C & L bands
+        spectrum_raw = obs[:, idx : idx + self.k_paths*6*self.num_bands]
         idx += self.k_paths*6*self.num_bands
+        spectrum = spectrum_raw.view(batch_size, self.k_paths, self.num_bands, 6)
+        #print("Spectrum in forward", spectrum_raw)
 
-        feature_matrix = obs[:, idx:idx + self.num_edges*self.k_paths].reshape(batch_size, self.k_paths, self.num_edges)
-        idx += self.num_edges*self.k_paths
+        # separate C/L band
+        c_band_features = spectrum[:, :, 0, :]  # shape [batch_size, k_paths, 6]
+        l_band_features = spectrum[:, :, 1, :]  # shape [batch_size, k_paths, 6]
 
-        adj_matrix = obs[:, idx:].reshape(batch_size, self.num_edges, self.num_edges)
+        # 4) Feature matrix: [batch_size, k_paths, num_edges]
+        feature_matrix = obs[:, idx : idx + self.num_edges * self.k_paths]
+        #print("FM(X)", feature_matrix)
+        feature_matrix = feature_matrix.view(batch_size, self.num_edges, self.k_paths)
+        idx += self.num_edges * self.k_paths
 
-        rnn_inputs= []
-        path_sequences = []
-        for i in range(self.k_paths):
-            print("For path ------------------------------------------------------------------------------",i)
-            path_features = feature_matrix[:, i, :]
-            path_features= path_features.t()
-            print("Path_feature shape", path_features.shape)
-            path_length = torch.sum(path_features != 0).item()    
-            path_outputs = []      
-            for step in range(path_length):
-                #print("For step----------------------------------------------------------------------", step)
-                input_features = path_features if step == 0 else None
-                #print("Input features", input_features.shape)
-                switch_on = step < path_length
-                #print("Switch on", switch_on)
-                out = self.gcn_modules[i](input_features, adj_matrix, switch_on)
-                path_outputs.append(out)
+        # 5) Adjacency: [batch_size, num_edges, num_edges]
+        adj_matrix = obs[:, idx:].view(batch_size, self.num_edges, self.num_edges)
 
-            # Continue propagating final memory value until P steps
-            final_memory = self.gcn_modules[i].memory
-            for _ in range(path_length, self.P):
-                path_outputs.append(final_memory)   
+        # 6) Build GCN “unrolled” sequences per path
+        #    We want shape => [batch_size, k_paths, P, num_edges, 1]
+        all_path_sequences = []
+        for b in range(batch_size):
+            # Reset GCN memory for each new sample in batch
+            for module in self.gcn_modules:
+                module.reset_memory()
 
-            # Stack P outputs for this path
-            path_sequence = torch.stack(path_outputs, dim=0)
-            path_sequences.append(path_sequence)
-            #print("path_sequence", path_sequence)
-            #print("path_sequence shape", path_sequence.shape)
-            
-        
-        # Stack all paths' sequences
-        # Process through RNN
-        rnn_inputs = torch.stack(path_sequences, dim=0)  # [k_paths, P, num_edges]
-        rnn_out = self.rnn(rnn_inputs)  # [batch_size, k_paths*hidden_size]
-        print("RNN inputs", rnn_inputs.shape)
-        
-        print("rnn_out shape:", rnn_out.shape)
-        print("source_dest shape:", source_dest.shape)
-        print("slots shape:", slots.shape)
-        print("spectrum shape:", spectrum.shape)
+            # Collect the P-step sequences for each path
+            path_outputs_for_batch = []
+            for i in range(self.k_paths):
+                # path_features: [num_edges] => reshape [num_edges, 1]
+                #print("For path----------------------------------------------------------",i)
+                pf = feature_matrix[b, :, i].unsqueeze(-1)
+                #print("X",pf.t())
+                # Count how many edges are nonzero (or define your path_length differently)
+                path_length = torch.sum(pf != 0).item()
+                #print("path length", path_length)
 
-        #combined = torch.cat([rnn_out, source_dest, slots, spectrum], dim=1)
-        # Combine all features with separate C and L band features
+                single_path_outputs = []
+                for step in range(self.P):
+                    if step == 0:
+                        # first step uses pf
+                        out = self.gcn_modules[i](pf, adj_matrix[b], switch_on=(step < path_length))
+                        #print("Out in step=0", out.t())
+                    else:
+                        # subsequent steps pass None
+                        out = self.gcn_modules[i](None, adj_matrix[b], switch_on=(step < path_length))
+
+                    single_path_outputs.append(out)  # each out: [num_edges, 1]
+
+                # stack => [P, num_edges, 1]
+                single_path_seq = torch.stack(single_path_outputs, dim=0)
+                path_outputs_for_batch.append(single_path_seq)
+
+            # shape => [k_paths, P, num_edges, 1]
+            path_outputs_for_batch = torch.stack(path_outputs_for_batch, dim=0)
+            # Collect for this batch element
+            all_path_sequences.append(path_outputs_for_batch)
+
+        # Now stack across batch => [batch_size, k_paths, P, num_edges, 1]
+        all_path_sequences = torch.stack(all_path_sequences, dim=0)
+
+        # 7) Pass to RNN aggregator
+        #    RNN expects shape [batch_size, k_paths, P, feature_dim], so we flatten num_edges*1 =>  num_edges
+        #    -> final shape for each time step = 44
+        all_path_sequences = all_path_sequences.view(
+            batch_size, self.k_paths, self.P, self.num_edges
+        )
+        rnn_out = self.rnn(all_path_sequences)  # => [batch_size, k_paths * hidden_size=256]
+        #print("RNN out", rnn_out)
+
+        # 8) Concatenate with the other features
         combined = torch.cat([
-            rnn_out,                    # Path features from RNN
-            source_dest,                # Source-destination encoding
-            slots,                      # Slots per path
-            c_band_features.reshape(batch_size, -1),        # [batch_size, k_paths*6]
-            l_band_features.reshape(batch_size, -1)         # [batch_size, k_paths*6] 
+            rnn_out,  # [batch_size, k_paths*256]
+            source_dest,                   # [batch_size, 2*num_original_nodes]
+            slots,                         # [batch_size, k_paths]
+            c_band_features.reshape(batch_size, -1),  # [batch_size, k_paths*6]
+            l_band_features.reshape(batch_size, -1)   # [batch_size, k_paths*6]
         ], dim=1)
-        return self.fc(combined)
 
+        # 9) Pass through the final MLP
+        fc_out = self.fc(combined)
+        print("FC out",fc_out.shape)
+        return fc_out
+
+
+# ------------------- SB3 Policy -------------------
 class DeepRMSAPolicy(ActorCriticPolicy):
-   def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
-       super(DeepRMSAPolicy, self).__init__(
-           observation_space,
-           action_space,
-           lr_schedule,
-           **kwargs
-       )
-       self.policy_net = nn.Linear(self.features_dim, action_space.n)
-       self.value_net = nn.Linear(self.features_dim, 1)
-       
-   def forward(self, obs, deterministic=False):
-       features = self.extract_features(obs)
-       action_logits = self.policy_net(features)
-       action_probs = F.softmax(action_logits, dim=1)
-       value = self.value_net(features)
-       return action_probs, value
+    def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
+        super(DeepRMSAPolicy, self).__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            **kwargs
+        )
+        print("Action in Policy", action_space)
+        self.policy_net = nn.Linear(self.features_dim, action_space.n)
+        self.value_net = nn.Linear(self.features_dim, 1)
 
+        print("Feature Extractor Output Size (features_dim):", self.features_dim)
+        print("Policy Network Input Size (policy_net):", self.policy_net.in_features)
+        print("Value Network Input Size (value_net):", self.value_net.in_features)
 
+    def forward(self, obs, deterministic=False):
+        features = self.extract_features(obs)
+
+        # 2) Actor head -> unnormalized logits
+        logits = self.policy_net(features)  # shape: [batch_size, n_actions]
+
+        # 3) Critic -> value estimates
+        values = self.value_net(features).flatten()  # shape: [batch_size]
+
+        # 4) Build the categorical distribution from logits
+        dist = Categorical(logits=logits)
+        
+
+        # 5) Decide how to pick actions:
+        if deterministic:
+            # Argmax if in 'deterministic' mode
+            actions = torch.argmax(logits, dim=1)
+        else:
+            # Sample from the distribution
+            actions = dist.sample()
+
+        # 6) log_probs for the chosen actions
+        log_probs = dist.log_prob(actions)
+
+        # Inside the forward method of the policy
+        print("Feature Extractor Output Shape:", features.shape)
+        print("Logits Shape (Policy Output):", logits.shape)
+        print("Values Shape (Critic Output):", values.shape)
+
+        return actions, values, log_probs
 
 
 def main():
